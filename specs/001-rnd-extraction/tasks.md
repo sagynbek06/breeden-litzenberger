@@ -102,13 +102,13 @@ description: "Task list for feature implementation"
 
 ## Phase 6: Polish & Cross-Cutting Concerns
 
-- [ ] T029 [P] Write `docs/theory.md`: derive, in the author's own words, with formulas in LaTeX-style fenced code blocks followed by a plain-language explanation of every symbol — (a) why raw price differentiation is numerically unstable and what SVI buys instead, (b) the Breeden-Litzenberger formula and its convexity argument, (c) the raw SVI parameterization and the Gatheral-Jacquier no-butterfly-arbitrage condition, (d) the American-vs-European / OTM-only approximation and why it's necessary with yfinance data specifically (constitution Principles I, II, VIII)
-- [ ] T030 [P] Write `docs/usage.md`: install instructions, an `extract()` quick example, and CLI usage, referencing quickstart.md's scenarios
-- [ ] T031 [P] Write `README.md`: project overview, install command, quickstart snippet, link to `docs/theory.md`
-- [ ] T032 Implement `breeden_litzenberger/cli.py`: `typer` command `bl extract --ticker --expiration [--rate] [--dividend-yield] [--min-open-interest] [--min-volume] [--format text|json]` wrapping `extract()` per contracts/public_api.md's CLI contract; non-zero exit code and a stderr message only on a raised exception, exit 0 regardless of `Verdict` value otherwise. (Depends on: T017, T025, T026.)
-- [ ] T033 [P] Cross-check every formula-bearing module's docstring (`core/black_scholes.py`, `core/smile.py`, `core/density.py`) against `docs/theory.md` for citation consistency (constitution Principle I). (Depends on: T029.)
-- [ ] T034 Run `mypy --strict` across `breeden_litzenberger/` and fix every reported error (constitution: API & Engineering Standards)
-- [ ] T035 Execute quickstart.md Scenarios 1–6 end-to-end and fix any discrepancies found
+- [X] T029 [P] Write `docs/theory.md`: derive, in the author's own words, with formulas in LaTeX-style fenced code blocks followed by a plain-language explanation of every symbol — (a) why raw price differentiation is numerically unstable and what SVI buys instead, (b) the Breeden-Litzenberger formula and its convexity argument, (c) the raw SVI parameterization and the Gatheral-Jacquier no-butterfly-arbitrage condition, (d) the American-vs-European / OTM-only approximation and why it's necessary with yfinance data specifically (constitution Principles I, II, VIII)
+- [X] T030 [P] Write `docs/usage.md`: install instructions, an `extract()` quick example, and CLI usage, referencing quickstart.md's scenarios
+- [X] T031 [P] Write `README.md`: project overview, install command, quickstart snippet, link to `docs/theory.md`
+- [X] T032 Implement `breeden_litzenberger/cli.py`: `typer` command `bl extract --ticker --expiration [--rate] [--dividend-yield] [--min-open-interest] [--min-volume] [--format text|json]` wrapping `extract()` per contracts/public_api.md's CLI contract; non-zero exit code and a stderr message only on a raised exception, exit 0 regardless of `Verdict` value otherwise. (Depends on: T017, T025, T026.)
+- [X] T033 [P] Cross-check every formula-bearing module's docstring (`core/black_scholes.py`, `core/smile.py`, `core/density.py`) against `docs/theory.md` for citation consistency (constitution Principle I). (Depends on: T029.)
+- [X] T034 Run `mypy --strict` across `breeden_litzenberger/` and fix every reported error (constitution: API & Engineering Standards)
+- [X] T035 Execute quickstart.md Scenarios 1–6 end-to-end and fix any discrepancies found
 - [ ] T036 Tag `v0.1.0` per constitution Git & Release Workflow once all phases pass
 
 ---
