@@ -21,6 +21,7 @@ from breeden_litzenberger.core.black_scholes import ImpliedVolError, implied_vol
 from breeden_litzenberger.core.density import DensityDiagnostics, DensityGrid, extract_density
 from breeden_litzenberger.core.moments import DensityMoments, compute_moments
 from breeden_litzenberger.core.smile import FittedSmile, calibrate_svi
+from breeden_litzenberger.core.smile_metrics import SmileShapeMetrics, compute_smile_shape_metrics
 from breeden_litzenberger.data.rates import RateInputs, resolve_rate_inputs
 from breeden_litzenberger.data.yfinance_loader import OptionChainSnapshot, OptionType, fetch_snapshot
 
@@ -73,6 +74,26 @@ class InvalidExpirationError(ValueError):
     """``expiration`` is not strictly in the future relative to the snapshot (spec FR-004)."""
 
 
+class NoPlotDataError(ValueError):
+    """``plot_data()`` called on a report with no fitted smile (spec Edge Cases)."""
+
+
+@dataclass(frozen=True)
+class PlotData:
+    """The series needed to plot the fitted smile and the extracted density
+    (spec FR-014c; contracts/public_api.md) -- plain data, not a rendered
+    chart; rendering is the caller's concern (spec Assumptions).
+    """
+
+    smile_strikes: np.ndarray
+    smile_market_ivs: np.ndarray
+    smile_fitted_strikes: np.ndarray
+    smile_fitted_ivs: np.ndarray
+    density_strikes: np.ndarray
+    density_values: np.ndarray
+    lognormal_benchmark_density: np.ndarray
+
+
 @dataclass(frozen=True)
 class ExtractionReport:
     """The single combined result of one extraction (spec FR-013, FR-014)."""
@@ -85,7 +106,7 @@ class ExtractionReport:
     density_grid: DensityGrid | None
     diagnostics: DensityDiagnostics | None
     moments: DensityMoments | None
-    smile_shape_metrics: Any | None  # wired in by core/smile_metrics.py (User Story 3)
+    smile_shape_metrics: SmileShapeMetrics | None
     verdict: Verdict
     verdict_message: str
 
@@ -106,6 +127,7 @@ class ExtractionReport:
             },
             "diagnostics": None if self.diagnostics is None else asdict(self.diagnostics),
             "moments": None if self.moments is None else asdict(self.moments),
+            "smile_shape_metrics": None if self.smile_shape_metrics is None else asdict(self.smile_shape_metrics),
             "density_grid": None
             if self.density_grid is None
             else {
@@ -151,7 +173,53 @@ class ExtractionReport:
                 f"Moments: mean={m.mean:.4f} variance={m.variance:.4f} "
                 f"skew={m.skewness:.4f} excess_kurtosis={m.excess_kurtosis:.4f}",
             ]
+        if self.smile_shape_metrics is not None:
+            s = self.smile_shape_metrics
+            lines += [
+                "",
+                f"Smile shape: ATM vol={s.atm_implied_vol:.4%}  "
+                f"25d risk reversal={s.risk_reversal_25d:.4%}  25d butterfly={s.butterfly_25d:.4%}",
+            ]
         return "\n".join(lines)
+
+    def plot_data(self) -> PlotData:
+        """The series needed to plot the fitted smile vs. raw IV points, and
+        the extracted density vs. a lognormal benchmark (spec FR-014c).
+        """
+        if self.fitted_smile is None or self.density_grid is None or self.smile_shape_metrics is None:
+            raise NoPlotDataError(
+                f"no plot data available for verdict={self.verdict.name}: "
+                f"a smile must have been fitted first"
+            )
+
+        t = _time_to_expiration(self.snapshot)
+        smile = self.fitted_smile
+
+        smile_strikes = np.array([p.strike for p in smile.retained_points])
+        smile_market_ivs = np.array([p.implied_vol for p in smile.retained_points])
+
+        fitted_strikes = np.linspace(float(smile_strikes.min()), float(smile_strikes.max()), 200)
+        k_fitted = np.log(fitted_strikes / smile.forward_price)
+        w_fitted = smile.params.total_variance(k_fitted)
+        fitted_ivs = np.sqrt(np.maximum(w_fitted, 1e-12) / t)
+
+        atm_vol = self.smile_shape_metrics.atm_implied_vol
+        density_strikes = self.density_grid.strikes
+        v = atm_vol * atm_vol * t
+        mu = np.log(smile.forward_price) - 0.5 * v
+        lognormal_benchmark = (1.0 / (density_strikes * atm_vol * np.sqrt(2 * np.pi * t))) * np.exp(
+            -((np.log(density_strikes) - mu) ** 2) / (2 * v)
+        )
+
+        return PlotData(
+            smile_strikes=smile_strikes,
+            smile_market_ivs=smile_market_ivs,
+            smile_fitted_strikes=fitted_strikes,
+            smile_fitted_ivs=fitted_ivs,
+            density_strikes=density_strikes,
+            density_values=self.density_grid.density,
+            lognormal_benchmark_density=lognormal_benchmark,
+        )
 
 
 def _compute_forward_price(spot: float, r: float, q: float, t: float) -> float:
@@ -290,6 +358,9 @@ def build_report(
         fitted_smile, snapshot.spot_price, t, rates.risk_free_rate, rates.dividend_yield
     )
     moments = compute_moments(density_grid)
+    smile_shape_metrics = compute_smile_shape_metrics(
+        fitted_smile, snapshot.spot_price, t, rates.risk_free_rate, rates.dividend_yield
+    )
 
     if not fitted_smile.butterfly_arbitrage_free:
         verdict = Verdict.ARBITRAGE_DETECTED
@@ -318,7 +389,7 @@ def build_report(
         density_grid=density_grid,
         diagnostics=diagnostics,
         moments=moments,
-        smile_shape_metrics=None,
+        smile_shape_metrics=smile_shape_metrics,
         verdict=verdict,
         verdict_message=verdict_message,
     )
