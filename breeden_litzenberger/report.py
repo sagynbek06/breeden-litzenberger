@@ -1,0 +1,324 @@
+"""Top-level orchestration: single-call, single-snapshot RND extraction (spec FR-013).
+
+This is the seam between data/ (pandas/yfinance) and core/ (pure
+numpy/scipy): an OptionChainSnapshot's OptionQuote list is converted into
+plain CleanOTMPoint/ExcludedQuote records here before anything reaches
+core/, and this is where the single top-level public operation (extract())
+is assembled from core/'s independently-tested pieces (plan.md Structure
+Decision).
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import asdict, dataclass
+from datetime import date
+from enum import Enum
+from typing import Any
+
+import numpy as np
+
+from breeden_litzenberger.core.black_scholes import ImpliedVolError, implied_volatility
+from breeden_litzenberger.core.density import DensityDiagnostics, DensityGrid, extract_density
+from breeden_litzenberger.core.moments import DensityMoments, compute_moments
+from breeden_litzenberger.core.smile import FittedSmile, calibrate_svi
+from breeden_litzenberger.data.rates import RateInputs, resolve_rate_inputs
+from breeden_litzenberger.data.yfinance_loader import OptionChainSnapshot, OptionType, fetch_snapshot
+
+_DAYS_PER_YEAR = 365.25  # spec FR-004's explicit calendar-day convention
+
+# Minimum retained points to calibrate a 5-parameter SVI smile at all.
+# Below this the fit would be underdetermined, not just noisy -- spec
+# leaves the exact threshold as an implementation choice (Assumptions).
+_MIN_POINTS_FOR_SMILE_FIT = 5
+
+
+@dataclass(frozen=True)
+class LiquidityFloor:
+    """Configurable liquidity exclusion rule (spec FR-005; default per spec.md Assumptions)."""
+
+    min_open_interest: int = 0
+    min_volume: int = 0
+
+
+@dataclass(frozen=True)
+class ExcludedQuote:
+    """A quote dropped during cleaning or IV inversion, with the reason
+    (spec FR-005, FR-007) -- exclusions are logged, never silent.
+    """
+
+    strike: float
+    option_type: OptionType
+    reason: str
+
+
+@dataclass(frozen=True)
+class CleanOTMPoint:
+    """A retained quote after liquidity/crossed-market/OTM selection (spec FR-005, FR-006)."""
+
+    strike: float
+    option_type: OptionType
+    mid_price: float
+
+
+class Verdict(Enum):
+    """Plain-language outcome classification (spec FR-013)."""
+
+    WELL_FIT_ARBITRAGE_FREE = "well-fit and arbitrage-free"
+    ARBITRAGE_DETECTED = "butterfly arbitrage detected at fitted parameters"
+    DIAGNOSTIC_WARNING = "fit converged but a diagnostic threshold was exceeded"
+    INSUFFICIENT_LIQUID_DATA = "insufficient liquid strikes to fit a smile"
+
+
+class InvalidExpirationError(ValueError):
+    """``expiration`` is not strictly in the future relative to the snapshot (spec FR-004)."""
+
+
+@dataclass(frozen=True)
+class ExtractionReport:
+    """The single combined result of one extraction (spec FR-013, FR-014)."""
+
+    ticker: str
+    expiration: date
+    snapshot: OptionChainSnapshot
+    rates: RateInputs
+    fitted_smile: FittedSmile | None
+    density_grid: DensityGrid | None
+    diagnostics: DensityDiagnostics | None
+    moments: DensityMoments | None
+    smile_shape_metrics: Any | None  # wired in by core/smile_metrics.py (User Story 3)
+    verdict: Verdict
+    verdict_message: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Structured-data rendering (spec FR-014a)."""
+        return {
+            "ticker": self.ticker,
+            "expiration": self.expiration.isoformat(),
+            "rates": asdict(self.rates),
+            "fitted_smile": None
+            if self.fitted_smile is None
+            else {
+                "params": asdict(self.fitted_smile.params),
+                "forward_price": self.fitted_smile.forward_price,
+                "fit_rmse_variance": self.fitted_smile.fit_rmse_variance,
+                "butterfly_arbitrage_free": self.fitted_smile.butterfly_arbitrage_free,
+                "arbitrage_margin": self.fitted_smile.arbitrage_check.margin,
+            },
+            "diagnostics": None if self.diagnostics is None else asdict(self.diagnostics),
+            "moments": None if self.moments is None else asdict(self.moments),
+            "density_grid": None
+            if self.density_grid is None
+            else {
+                "strikes": self.density_grid.strikes.tolist(),
+                "density": self.density_grid.density.tolist(),
+            },
+            "verdict": self.verdict.name,
+            "verdict_message": self.verdict_message,
+        }
+
+    def summary(self) -> str:
+        """Human-readable text rendering (spec FR-014b)."""
+        lines = [
+            f"Risk-Neutral Density Extraction Report: {self.ticker} exp {self.expiration.isoformat()}",
+            f"Verdict: {self.verdict.value} -- {self.verdict_message}",
+            "",
+            f"Inputs: spot={self.snapshot.spot_price:.4f}  "
+            f"r={self.rates.risk_free_rate:.4%} ({self.rates.risk_free_rate_source})  "
+            f"q={self.rates.dividend_yield:.4%} ({self.rates.dividend_yield_source})",
+        ]
+        if self.fitted_smile is not None:
+            p = self.fitted_smile.params
+            lines += [
+                "",
+                f"Fitted SVI: a={p.a:.6f} b={p.b:.6f} rho={p.rho:.4f} m={p.m:.4f} sigma={p.sigma:.4f}",
+                f"Fit RMSE (variance space): {self.fitted_smile.fit_rmse_variance:.3e}",
+                f"Butterfly-arbitrage-free: {self.fitted_smile.butterfly_arbitrage_free} "
+                f"(margin={self.fitted_smile.arbitrage_check.margin:.6f})",
+            ]
+        if self.diagnostics is not None:
+            d = self.diagnostics
+            lines += [
+                "",
+                f"Density non-negative: {d.is_non_negative}  integral={d.integral:.6f} "
+                f"(normalization_error={d.normalization_error:.4%})",
+                f"Forward price: theoretical={d.forward_price_theoretical:.4f} "
+                f"realized={d.forward_price_realized:.4f} (deviation={d.forward_price_deviation:.4%})",
+            ]
+        if self.moments is not None:
+            m = self.moments
+            lines += [
+                "",
+                f"Moments: mean={m.mean:.4f} variance={m.variance:.4f} "
+                f"skew={m.skewness:.4f} excess_kurtosis={m.excess_kurtosis:.4f}",
+            ]
+        return "\n".join(lines)
+
+
+def _compute_forward_price(spot: float, r: float, q: float, t: float) -> float:
+    return float(spot * np.exp((r - q) * t))
+
+
+def _time_to_expiration(snapshot: OptionChainSnapshot) -> float:
+    """T = (expiration - fetched_at.date()).days / 365.25 (spec FR-004)."""
+    days = (snapshot.expiration - snapshot.fetched_at.date()).days
+    if days <= 0:
+        raise InvalidExpirationError(
+            f"expiration {snapshot.expiration} is not strictly in the future relative to "
+            f"the snapshot fetched at {snapshot.fetched_at}"
+        )
+    return days / _DAYS_PER_YEAR
+
+
+def _clean_and_select_otm(
+    snapshot: OptionChainSnapshot, forward_price: float, liquidity_floor: LiquidityFloor
+) -> tuple[list[CleanOTMPoint], list[ExcludedQuote]]:
+    """FR-005 (liquidity/crossed-market cleaning) + FR-006 (OTM selection):
+    OTM puts below the forward price, OTM calls above it.
+    """
+    retained: list[CleanOTMPoint] = []
+    excluded: list[ExcludedQuote] = []
+
+    for quote in snapshot.quotes:
+        # NaN bid/ask (real yfinance quotes, e.g. an illiquid strike with no
+        # posted bid) must be checked explicitly: `math.nan <= 0` and
+        # `math.nan > x` both evaluate to False in Python, so a plain
+        # `quote.bid <= 0` check silently lets a NaN bid through to become a
+        # NaN mid price a few steps downstream (verified against a real SPY
+        # chain during development -- see tasks.md T014 notes).
+        if math.isnan(quote.bid) or math.isnan(quote.ask) or quote.bid <= 0:
+            excluded.append(ExcludedQuote(quote.strike, quote.option_type, "zero_bid"))
+            continue
+        if quote.bid > quote.ask:
+            excluded.append(ExcludedQuote(quote.strike, quote.option_type, "crossed_market"))
+            continue
+        if quote.open_interest < liquidity_floor.min_open_interest and quote.volume < liquidity_floor.min_volume:
+            excluded.append(ExcludedQuote(quote.strike, quote.option_type, "below_liquidity_floor"))
+            continue
+
+        is_otm = (quote.option_type == "put" and quote.strike < forward_price) or (
+            quote.option_type == "call" and quote.strike > forward_price
+        )
+        if not is_otm:
+            excluded.append(ExcludedQuote(quote.strike, quote.option_type, "not_otm"))
+            continue
+
+        retained.append(CleanOTMPoint(strike=quote.strike, option_type=quote.option_type, mid_price=quote.mid_price))
+
+    return retained, excluded
+
+
+def extract(
+    ticker: str,
+    expiration: date,
+    *,
+    risk_free_rate: float | None = None,
+    dividend_yield: float | None = None,
+    liquidity_floor: LiquidityFloor | None = None,
+) -> ExtractionReport:
+    """The single top-level operation (spec FR-013). See contracts/public_api.md."""
+    snapshot = fetch_snapshot(ticker, expiration)
+    rates = resolve_rate_inputs(ticker, risk_free_rate, dividend_yield)
+    floor = liquidity_floor if liquidity_floor is not None else LiquidityFloor()
+    return build_report(snapshot, rates, floor)
+
+
+def build_report(
+    snapshot: OptionChainSnapshot,
+    rates: RateInputs,
+    liquidity_floor: LiquidityFloor | None = None,
+) -> ExtractionReport:
+    """Everything after the data fetch -- a pure function of (snapshot, rates,
+    liquidity_floor) with no network access, so it can be exercised
+    deterministically without mocking yfinance (tests/test_report_integration.py).
+    ``extract()`` is a thin wrapper: fetch, then delegate here.
+    """
+    floor = liquidity_floor if liquidity_floor is not None else LiquidityFloor()
+    ticker, expiration = snapshot.ticker, snapshot.expiration
+
+    t = _time_to_expiration(snapshot)
+    forward_price = _compute_forward_price(snapshot.spot_price, rates.risk_free_rate, rates.dividend_yield, t)
+
+    clean_points, excluded = _clean_and_select_otm(snapshot, forward_price, floor)
+
+    iv_points = []
+    for point in clean_points:
+        try:
+            iv_points.append(
+                implied_volatility(
+                    point.mid_price,
+                    snapshot.spot_price,
+                    point.strike,
+                    t,
+                    rates.risk_free_rate,
+                    rates.dividend_yield,
+                    point.option_type,
+                    forward_price,
+                )
+            )
+        except ImpliedVolError as exc:
+            excluded.append(ExcludedQuote(point.strike, point.option_type, exc.reason))
+
+    if len(iv_points) < _MIN_POINTS_FOR_SMILE_FIT:
+        return ExtractionReport(
+            ticker=ticker,
+            expiration=expiration,
+            snapshot=snapshot,
+            rates=rates,
+            fitted_smile=None,
+            density_grid=None,
+            diagnostics=None,
+            moments=None,
+            smile_shape_metrics=None,
+            verdict=Verdict.INSUFFICIENT_LIQUID_DATA,
+            verdict_message=(
+                f"only {len(iv_points)} liquid OTM quotes survived cleaning; at least "
+                f"{_MIN_POINTS_FOR_SMILE_FIT} are required to calibrate a 5-parameter SVI smile"
+            ),
+        )
+
+    calibrated = calibrate_svi(iv_points, forward_price)
+    fitted_smile = FittedSmile(
+        params=calibrated.params,
+        forward_price=calibrated.forward_price,
+        fit_rmse_variance=calibrated.fit_rmse_variance,
+        arbitrage_check=calibrated.arbitrage_check,
+        retained_points=calibrated.retained_points,
+        excluded_points=excluded,  # cleaning-stage + IV-inversion-stage exclusions, merged
+    )
+
+    density_grid, diagnostics = extract_density(
+        fitted_smile, snapshot.spot_price, t, rates.risk_free_rate, rates.dividend_yield
+    )
+    moments = compute_moments(density_grid)
+
+    if not fitted_smile.butterfly_arbitrage_free:
+        verdict = Verdict.ARBITRAGE_DETECTED
+        verdict_message = (
+            f"SVI calibration converged but the fitted smile violates the Gatheral-Jacquier "
+            f"no-butterfly-arbitrage condition (margin={fitted_smile.arbitrage_check.margin:.6f} "
+            f"at k={fitted_smile.arbitrage_check.margin_at_k:.4f})"
+        )
+    elif diagnostics.flagged:
+        verdict = Verdict.DIAGNOSTIC_WARNING
+        verdict_message = (
+            f"smile is arbitrage-free but a diagnostic threshold was exceeded "
+            f"(normalization_error={diagnostics.normalization_error:.4%}, "
+            f"forward_price_deviation={diagnostics.forward_price_deviation:.4%})"
+        )
+    else:
+        verdict = Verdict.WELL_FIT_ARBITRAGE_FREE
+        verdict_message = "smile is arbitrage-free and well-fit; diagnostics within tolerance"
+
+    return ExtractionReport(
+        ticker=ticker,
+        expiration=expiration,
+        snapshot=snapshot,
+        rates=rates,
+        fitted_smile=fitted_smile,
+        density_grid=density_grid,
+        diagnostics=diagnostics,
+        moments=moments,
+        smile_shape_metrics=None,
+        verdict=verdict,
+        verdict_message=verdict_message,
+    )

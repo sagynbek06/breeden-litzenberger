@@ -1,6 +1,10 @@
 """breeden_litzenberger: market-implied risk-neutral density extraction.
 
-Public surface (see specs/001-rnd-extraction/contracts/public_api.md):
-``extract``, ``ExtractionReport``, ``Verdict``, ``LiquidityFloor``.
-Populated incrementally as report.py is implemented (tasks T016-T018).
+Curated public surface (research.md §5; contracts/public_api.md). Every
+other name in this package -- including everything in core/ and data/ --
+is reachable only via explicit submodule import and is not part of the
+supported contract.
 """
+from breeden_litzenberger.report import ExtractionReport, LiquidityFloor, Verdict, extract
+
+__all__ = ["extract", "ExtractionReport", "Verdict", "LiquidityFloor"]
