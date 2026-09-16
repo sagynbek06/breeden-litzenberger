@@ -109,7 +109,7 @@ description: "Task list for feature implementation"
 - [X] T033 [P] Cross-check every formula-bearing module's docstring (`core/black_scholes.py`, `core/smile.py`, `core/density.py`) against `docs/theory.md` for citation consistency (constitution Principle I). (Depends on: T029.)
 - [X] T034 Run `mypy --strict` across `breeden_litzenberger/` and fix every reported error (constitution: API & Engineering Standards)
 - [X] T035 Execute quickstart.md Scenarios 1–6 end-to-end and fix any discrepancies found
-- [ ] T036 Tag `v0.1.0` per constitution Git & Release Workflow once all phases pass
+- [X] T036 Tag `v0.1.0` per constitution Git & Release Workflow once all phases pass
 
 ---
 
