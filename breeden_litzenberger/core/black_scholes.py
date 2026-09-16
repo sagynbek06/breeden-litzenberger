@@ -72,10 +72,24 @@ def delta(spot: float, strike: float, t: float, r: float, q: float, sigma: float
     return -exp(-q * t) * _norm_cdf(-d1)
 
 
-def _intrinsic_value(spot: float, strike: float, option_type: OptionType) -> float:
+def _intrinsic_value(spot: float, strike: float, t: float, r: float, q: float, option_type: OptionType) -> float:
+    """European lower bound: max(S*e^-qT - K*e^-rT, 0) for calls,
+    max(K*e^-rT - S*e^-qT, 0) for puts -- the discounted-forward intrinsic
+    value, not the undiscounted max(S-K,0)/max(K-S,0) American-exercise
+    bound. The American bound is NOT a valid lower bound for a European
+    option: found via hypothesis property-based testing that a real,
+    perfectly legitimate European put price (spot=50, strike=51.68,
+    T=1.5y, r=4.7%) sat below its naive max(K-S,0)=1.68 while its true
+    Black-Scholes price was 1.627 -- because at that rate and tenor the
+    discounted-forward bound is actually 0, not 1.68. Using the American
+    bound would incorrectly reject legitimate real quotes on longer-dated
+    or higher-rate European-style options (e.g. index options).
+    """
+    discounted_spot = spot * exp(-q * t)
+    discounted_strike = strike * exp(-r * t)
     if option_type == "call":
-        return max(spot - strike, 0.0)
-    return max(strike - spot, 0.0)
+        return max(discounted_spot - discounted_strike, 0.0)
+    return max(discounted_strike - discounted_spot, 0.0)
 
 
 @dataclass(frozen=True)
@@ -120,7 +134,7 @@ def implied_volatility(
     if market_price <= 0:
         raise ImpliedVolError("zero_price", f"non-positive market price {market_price!r} at strike {strike}")
 
-    intrinsic = _intrinsic_value(spot, strike, option_type)
+    intrinsic = _intrinsic_value(spot, strike, t, r, q, option_type)
     if market_price < intrinsic:
         raise ImpliedVolError(
             "below_intrinsic_value",

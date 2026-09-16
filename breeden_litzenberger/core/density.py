@@ -92,12 +92,36 @@ def _call_price_curve(strikes: np.ndarray, smile: FittedSmile, spot: float, t: f
     return np.array([price(spot, float(K), t, r, q, float(s), "call") for K, s in zip(strikes, sigma)])
 
 
+class InconsistentForwardError(ValueError):
+    """``smile.forward_price`` doesn't match spot*exp((r-q)*T) (spec: no
+    silent wrong answers). Found during development: a manually-constructed
+    ``FittedSmile`` with a forward_price inconsistent with the (spot, r, q)
+    passed here produces a real, non-noise pricing error (verified: a
+    forward mismatch of ~2% produced ~9% relative density error at some
+    strikes) -- not because either input is individually wrong, but because
+    the strike grid is anchored to ``smile.forward_price`` while
+    ``core.black_scholes.price`` is anchored to ``spot``/``r``/``q``
+    directly. The production pipeline (report.py) always derives
+    ``forward_price`` from the same (spot, r, q) it later passes here, so
+    this can never trigger in normal use; it exists to catch exactly the
+    kind of manual-construction mistake this check itself was written to
+    catch during this project's own test development.
+    """
+
+
 def extract_density(smile: FittedSmile, spot: float, t: float, r: float, q: float) -> tuple[DensityGrid, DensityDiagnostics]:
     """Reconstruct a dense call-price curve from ``smile`` and differentiate it twice.
 
     f(K) = exp(r*T) * d^2 C/dK^2 (Breeden & Litzenberger 1978), via central
     finite differences on the grid described in research.md §1.
     """
+    implied_forward = spot * exp((r - q) * t)
+    if abs(implied_forward - smile.forward_price) > 1e-6 * max(abs(smile.forward_price), 1.0):
+        raise InconsistentForwardError(
+            f"smile.forward_price={smile.forward_price!r} does not match "
+            f"spot*exp((r-q)*T)={implied_forward!r} for spot={spot!r}, r={r!r}, q={q!r}, T={t!r}"
+        )
+
     atm_w = float(smile.params.total_variance(np.array([0.0]))[0])
     half_range_k = _GRID_STD_DEVS * sqrt(max(atm_w, 1e-8))
     k_grid = np.linspace(-half_range_k, half_range_k, _GRID_MIN_POINTS)
