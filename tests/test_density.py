@@ -17,7 +17,7 @@ import pytest
 from breeden_litzenberger.core.black_scholes import implied_volatility
 from breeden_litzenberger.core.density import extract_density
 from breeden_litzenberger.core.moments import compute_moments
-from breeden_litzenberger.core.smile import calibrate
+from breeden_litzenberger.core.smile import calibrate_svi
 from tests._synthetic import analytic_lognormal_density, analytic_lognormal_moments, generate_synthetic_chain
 
 SCENARIOS = [
@@ -36,7 +36,7 @@ def _run_full_pipeline(spot, r, q, t, true_vol):
         for quote in chain.quotes
     ]
 
-    fitted_smile = calibrate(iv_points, forward_price=chain.forward)
+    fitted_smile = calibrate_svi(iv_points, forward_price=chain.forward)
     density_grid, diagnostics = extract_density(fitted_smile, spot, t, r, q)
     moments = compute_moments(density_grid)
 
