@@ -30,6 +30,18 @@ OptionType = Literal["call", "put"]
 MIN_VOL = 0.01
 MAX_VOL = 5.00
 
+# Relative floor below which "price is below intrinsic value" is treated as
+# floating-point noise, not a real violation. price() and _intrinsic_value()
+# compute via independent formulas (norm_cdf(d1)/norm_cdf(d2) vs direct
+# discount factors); for a deep-ITM, near-zero-time-value option the two can
+# differ by a few ULPs. Found via a real case (spot=100, strike=56.18,
+# T=0.25, r=5%, sigma=15%): price and intrinsic differed by -7.1e-15
+# absolute, -1.6e-16 relative -- machine epsilon, not a real mispricing.
+# 1e-9 is ~6 orders of magnitude looser than that noise floor, while still
+# ~6 orders of magnitude tighter than any real bid-ask spread this library
+# would ever see, so it can never mask a genuine degenerate quote.
+_INTRINSIC_VALUE_NOISE_TOLERANCE = 1e-9
+
 
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + erf(x / sqrt(2.0)))
@@ -135,7 +147,7 @@ def implied_volatility(
         raise ImpliedVolError("zero_price", f"non-positive market price {market_price!r} at strike {strike}")
 
     intrinsic = _intrinsic_value(spot, strike, t, r, q, option_type)
-    if market_price < intrinsic:
+    if market_price < intrinsic * (1.0 - _INTRINSIC_VALUE_NOISE_TOLERANCE):
         raise ImpliedVolError(
             "below_intrinsic_value",
             f"price {market_price} is below intrinsic value {intrinsic} for {option_type} strike {strike}",

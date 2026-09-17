@@ -91,6 +91,30 @@ excluded with a recorded reason, never silently coerced to a placeholder.
 Garbage in that step would become garbage everywhere downstream, at exactly
 the resolution (the smooth fitted curve) meant to filter garbage *out*.
 
+**Two subtleties in "priced below intrinsic value" worth stating explicitly,
+both found by actually generating a wide range of synthetic prices and
+inverting them, not by inspection.** First, the correct lower bound for a
+*European* option is the **discounted-forward** intrinsic value —
+`max(S*e^{-qT} - K*e^{-rT}, 0)` for calls, `max(K*e^{-rT} - S*e^{-qT}, 0)` for
+puts — not the undiscounted `max(S-K,0)`/`max(K-S,0)` bound that's valid for
+*American* early exercise. At a meaningful rate and tenor these two bounds
+diverge materially; using the American bound would incorrectly reject
+legitimate European quotes (verified: a real, unremarkable European put price
+at spot=50, strike=51.68, T=1.5y, r=4.7% sat below its naive American bound
+of 1.68 while its true price, 1.627, was perfectly valid — the correct
+discounted-forward bound there is actually 0). Second, for a deep
+in-the-money option with very little time value left, `price()` and the
+intrinsic-value formula are two independently-computed expressions that can
+differ by a few floating-point ULPs even when mathematically identical; the
+comparison carries a small (`1e-9` relative), explicitly documented tolerance
+for exactly this, verified against a real case where the gap was `~1.6e-16`
+relative — machine epsilon, not a mispricing. Deep enough in the money,
+`vega -> 0` and implied volatility becomes numerically unrecoverable by any
+method regardless of tolerance — that's not a bug to fix, it's the same
+"vega collapses away from the money" fact mentioned above, and it's part of
+why this library restricts itself to out-of-the-money quotes in the first
+place (§6).
+
 ## 3. The raw SVI smile
 
 Reference: Gatheral, J. (2004), "A Parsimonious Arbitrage-Free Implied

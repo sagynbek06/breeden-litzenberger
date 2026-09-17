@@ -83,6 +83,32 @@ def test_zero_price_raises():
     assert exc_info.value.reason == "zero_price"
 
 
+def test_intrinsic_boundary_noise_does_not_cause_wrong_rejection_reason():
+    """Regression test: a deep-ITM, near-zero-time-value call (spot=100,
+    strike=56.18, T=0.25, r=5%, sigma=15%) has a true Black-Scholes price
+    only ~1.6e-16 relative below its own intrinsic value -- pure floating-
+    point noise from price() and _intrinsic_value() computing via
+    independent formulas, not a real mispricing.
+
+    This exact strike is ALSO so deep in-the-money that vega is genuinely
+    ~0 there (verified: price is essentially insensitive to sigma across
+    the *entire* [1%, 500%] bracket), so implied vol is not numerically
+    recoverable by any method -- that part is a real, unavoidable Black-
+    Scholes property, not a bug (see core/density.py InconsistentForwardError
+    docstring and docs/theory.md for the general pattern of documenting
+    these boundaries rather than working around them). The bug this test
+    guards against is specifically the *wrong reason*: before the fix, this
+    case incorrectly raised "below_intrinsic_value" (implying a data
+    error) instead of the honest "iv_bracket_failure" (implying "not
+    recoverable at this precision").
+    """
+    spot, strike, t, r, q, sigma0 = 100.0, 56.17630689516089, 0.25, 0.05, 0.0, 0.15
+    true_price = bs.price(spot, strike, t, r, q, sigma0, "call")
+    with pytest.raises(bs.ImpliedVolError) as exc_info:
+        bs.implied_volatility(true_price, spot, strike, t, r, q, "call", spot * math.exp((r - q) * t))
+    assert exc_info.value.reason == "iv_bracket_failure"
+
+
 def test_iv_bracket_failure_raises():
     # A price no volatility in [1%, 500%] can reproduce: above the max-vol price.
     absurd_price = bs.price(100.0, 100.0, 1.0, 0.0, 0.0, bs.MAX_VOL, "call") + 50.0
