@@ -65,6 +65,18 @@ assert report_a.to_dict() == report_b.to_dict()
 report out, since SVI calibration takes a fixed default initial guess and no
 unseeded randomness exists anywhere in the pipeline.
 
+**Verified nuance**: this scenario makes two genuinely separate live fetches,
+each capturing its own `fetched_at` timestamp. The pipeline's own
+determinism (identical *inputs* → identical output) is unconditionally
+guaranteed and unit-tested against a fixed in-memory fixture
+(`tests/test_report_integration.py::test_identical_inputs_produce_identical_reports`),
+immune to live market movement. Two live calls a few seconds apart on the
+*same calendar day* were confirmed to produce identical `to_dict()` output
+in practice, because `T` is computed from `fetched_at.date()` (calendar
+days), not the full timestamp — but this scenario's pass/fail also depends
+on yfinance returning unchanged quotes between the two calls, which is not
+itself something this library controls.
+
 ## Scenario 4 — Plot-ready data without extra computation (User Story 3, SC-006)
 
 ```python
