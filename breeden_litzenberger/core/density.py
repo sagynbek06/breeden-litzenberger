@@ -46,9 +46,14 @@ from breeden_litzenberger.core.smile import FittedSmile
 _GRID_STD_DEVS = 8.0
 _GRID_MIN_POINTS = 2000
 
-# Diagnostic flag thresholds fixed in /speckit.clarify (spec SC-004).
-_NORMALIZATION_ERROR_THRESHOLD = 0.01
-_FORWARD_PRICE_DEVIATION_THRESHOLD = 0.01
+# Diagnostic flag thresholds fixed in /speckit.clarify (spec SC-004). Both
+# are public so nothing else re-declares them: core/moments.py's
+# forward_price_check uses the forward one as its default, and report.py
+# names the specific check that tripped in its verdict -- so the `flagged`
+# diagnostic below and those two callers cannot silently disagree about
+# what "too far off" means.
+NORMALIZATION_ERROR_THRESHOLD = 0.01
+FORWARD_PRICE_RELATIVE_ERROR_THRESHOLD = 0.01
 
 # Floor below which a negative density value is treated as central-finite-
 # -difference floating-point noise rather than a genuine static-arbitrage
@@ -148,8 +153,8 @@ def extract_density(smile: FittedSmile, spot: float, t: float, r: float, q: floa
 
     flagged = (
         not is_non_negative
-        or normalization_error > _NORMALIZATION_ERROR_THRESHOLD
-        or forward_deviation > _FORWARD_PRICE_DEVIATION_THRESHOLD
+        or normalization_error > NORMALIZATION_ERROR_THRESHOLD
+        or forward_deviation > FORWARD_PRICE_RELATIVE_ERROR_THRESHOLD
         or not smile.butterfly_arbitrage_free
     )
 

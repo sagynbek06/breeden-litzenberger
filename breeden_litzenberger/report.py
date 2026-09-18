@@ -19,8 +19,18 @@ from typing import Any
 import numpy as np
 
 from breeden_litzenberger.core.black_scholes import ImpliedVolError, implied_volatility
-from breeden_litzenberger.core.density import DensityDiagnostics, DensityGrid, extract_density
-from breeden_litzenberger.core.moments import DensityMoments, compute_moments
+from breeden_litzenberger.core.density import (
+    NORMALIZATION_ERROR_THRESHOLD,
+    DensityDiagnostics,
+    DensityGrid,
+    extract_density,
+)
+from breeden_litzenberger.core.moments import (
+    DensityMoments,
+    ForwardPriceCheck,
+    compute_moments,
+    forward_price_check,
+)
 from breeden_litzenberger.core.smile import FittedSmile, calibrate_svi
 from breeden_litzenberger.core.smile_metrics import SmileShapeMetrics, compute_smile_shape_metrics
 from breeden_litzenberger.data.rates import RateInputs, resolve_rate_inputs
@@ -109,6 +119,7 @@ class ExtractionReport:
     density_grid: DensityGrid | None
     diagnostics: DensityDiagnostics | None
     moments: DensityMoments | None
+    forward_price_check: ForwardPriceCheck | None  # None only when no density was extracted
     smile_shape_metrics: SmileShapeMetrics | None
     verdict: Verdict
     verdict_message: str
@@ -130,6 +141,7 @@ class ExtractionReport:
             },
             "diagnostics": None if self.diagnostics is None else asdict(self.diagnostics),
             "moments": None if self.moments is None else asdict(self.moments),
+            "forward_price_check": None if self.forward_price_check is None else asdict(self.forward_price_check),
             "smile_shape_metrics": None if self.smile_shape_metrics is None else asdict(self.smile_shape_metrics),
             "density_grid": None
             if self.density_grid is None
@@ -166,8 +178,14 @@ class ExtractionReport:
                 "",
                 f"Density non-negative: {d.is_non_negative}  integral={d.integral:.6f} "
                 f"(normalization_error={d.normalization_error:.4%})",
-                f"Forward price: theoretical={d.forward_price_theoretical:.4f} "
-                f"realized={d.forward_price_realized:.4f} (deviation={d.forward_price_deviation:.4%})",
+            ]
+        if self.forward_price_check is not None:
+            c = self.forward_price_check
+            lines += [
+                f"Forward-price check: {'PASSED' if c.passed else 'FAILED'} -- "
+                f"RND mean={c.realized_mean:.4f} vs theoretical forward={c.theoretical_forward:.4f} "
+                f"(abs error={c.absolute_error:.4f}, rel error={c.relative_error:.4%}, "
+                f"limit={c.threshold:.4%})",
             ]
         if self.moments is not None:
             m = self.moments
@@ -223,6 +241,13 @@ class ExtractionReport:
             density_values=self.density_grid.density,
             lognormal_benchmark_density=lognormal_benchmark,
         )
+
+
+def _forward_check_failure_message(check: ForwardPriceCheck) -> str:
+    return (
+        f"forward-price check failed: extracted RND mean deviates from theoretical forward "
+        f"by {check.relative_error:.2%} (limit {check.threshold:.2%})"
+    )
 
 
 def _compute_forward_price(spot: float, r: float, q: float, t: float) -> float:
@@ -330,6 +355,7 @@ def build_report(
             density_grid=None,
             diagnostics=None,
             moments=None,
+            forward_price_check=None,
             smile_shape_metrics=None,
             verdict=Verdict.INSUFFICIENT_LIQUID_DATA,
             verdict_message=(
@@ -356,23 +382,48 @@ def build_report(
         fitted_smile, snapshot.spot_price, t, rates.risk_free_rate, rates.dividend_yield
     )
 
+    fwd_check = forward_price_check(
+        density_grid.density,
+        density_grid.strikes,
+        snapshot.spot_price,
+        rates.risk_free_rate,
+        rates.dividend_yield,
+        t,
+    )
+
+    # Every failed check is reported, not just the first: a forward-price
+    # failure must never be dropped from the verdict just because a more
+    # prominent problem (e.g. detected arbitrage) was also present, nor
+    # because the rest of the pipeline ran without raising.
+    problems: list[str] = []
     if not fitted_smile.butterfly_arbitrage_free:
-        verdict = Verdict.ARBITRAGE_DETECTED
-        verdict_message = (
+        problems.append(
             f"SVI calibration converged but the fitted smile violates the Gatheral-Jacquier "
             f"no-butterfly-arbitrage condition (margin={fitted_smile.arbitrage_check.margin:.6f} "
             f"at k={fitted_smile.arbitrage_check.margin_at_k:.4f})"
         )
-    elif diagnostics.flagged:
-        verdict = Verdict.DIAGNOSTIC_WARNING
-        verdict_message = (
-            f"smile is arbitrage-free but a diagnostic threshold was exceeded "
-            f"(normalization_error={diagnostics.normalization_error:.4%}, "
-            f"forward_price_deviation={diagnostics.forward_price_deviation:.4%})"
+    if not diagnostics.is_non_negative:
+        problems.append(f"extracted density is negative somewhere (min={diagnostics.min_density:.3e})")
+    if diagnostics.normalization_error > NORMALIZATION_ERROR_THRESHOLD:
+        problems.append(
+            f"extracted density integrates to {diagnostics.integral:.4f}, not 1 "
+            f"(normalization error {diagnostics.normalization_error:.2%})"
         )
+    if not fwd_check.passed:
+        problems.append(_forward_check_failure_message(fwd_check))
+
+    if not fitted_smile.butterfly_arbitrage_free:
+        verdict = Verdict.ARBITRAGE_DETECTED
+        verdict_message = "; ".join(problems)
+    elif problems:
+        verdict = Verdict.DIAGNOSTIC_WARNING
+        verdict_message = "smile is arbitrage-free, but " + "; ".join(problems)
     else:
         verdict = Verdict.WELL_FIT_ARBITRAGE_FREE
-        verdict_message = "smile is arbitrage-free and well-fit; diagnostics within tolerance"
+        verdict_message = (
+            "smile is arbitrage-free and well-fit; diagnostics within tolerance; forward-price check passed "
+            f"(extracted RND mean deviates from theoretical forward by {fwd_check.relative_error:.2%})"
+        )
 
     return ExtractionReport(
         ticker=ticker,
@@ -383,6 +434,7 @@ def build_report(
         density_grid=density_grid,
         diagnostics=diagnostics,
         moments=moments,
+        forward_price_check=fwd_check,
         smile_shape_metrics=smile_shape_metrics,
         verdict=verdict,
         verdict_message=verdict_message,

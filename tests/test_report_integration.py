@@ -11,12 +11,15 @@ forward, call strikes above it) rather than exercising an OTM filter here.
 """
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timedelta
 
 import numpy as np
 import pytest
 
+from breeden_litzenberger import report as report_module
 from breeden_litzenberger.core.black_scholes import price
+from breeden_litzenberger.core.smile import ButterflyArbitrageCheck
 from breeden_litzenberger.data.rates import RateInputs
 from breeden_litzenberger.data.yfinance_loader import OptionChainSnapshot, OptionQuote
 from breeden_litzenberger.report import LiquidityFloor, Verdict, build_report
@@ -130,6 +133,111 @@ def test_nan_bid_or_ask_is_excluded_not_propagated():
     assert report.fitted_smile is not None
     excluded_reasons = {(e.strike, e.reason) for e in report.fitted_smile.excluded_points}
     assert (bad.strike, "zero_bid") in excluded_reasons
+
+
+_FORWARD_FAILURE_PREFIX = "forward-price check failed: extracted RND mean deviates from theoretical forward by "
+
+
+def _patch_forward_check_to_see_a_biased_density(monkeypatch, factor: float) -> None:
+    """Make report.py's forward_price_check see a density whose mean is off by
+    ``factor`` (the density is scaled, so its K*f(K) integral scales too),
+    while extract_density's own diagnostics stay untouched. This is a genuine
+    numerical failure of the check on real pipeline output, not a stubbed
+    result -- it just simulates the failure mode the check exists to catch.
+    """
+    real = report_module.forward_price_check
+
+    def biased(rnd_grid, strikes, *rest):
+        return real(rnd_grid * factor, strikes, *rest)
+
+    monkeypatch.setattr(report_module, "forward_price_check", biased)
+
+
+def _patch_calibration_to_report_arbitrage(monkeypatch) -> None:
+    real = report_module.calibrate_svi
+
+    def with_arbitrage(points, forward_price):
+        fitted = real(points, forward_price)
+        violated = ButterflyArbitrageCheck(
+            is_arbitrage_free=False, margin=-0.1, margin_at_k=0.3, asymptotic_decay_holds=True
+        )
+        return dataclasses.replace(fitted, arbitrage_check=violated)
+
+    monkeypatch.setattr(report_module, "calibrate_svi", with_arbitrage)
+
+
+def test_forward_price_check_is_threaded_through_and_reported_as_passed():
+    snapshot = _make_snapshot(spot=100.0, r=0.03, q=0.01, t_years=1.0, true_vol=0.25)
+
+    report = build_report(snapshot, _make_rates(0.03, 0.01))
+
+    check = report.forward_price_check
+    assert check is not None and check.passed
+    assert check.realized_mean == report.diagnostics.forward_price_realized
+    assert check.relative_error == pytest.approx(check.absolute_error / check.theoretical_forward, rel=1e-12)
+    assert "forward-price check passed" in report.verdict_message
+    assert "failed" not in report.verdict_message
+    assert "Forward-price check: PASSED" in report.summary()
+    assert report.to_dict()["forward_price_check"]["passed"] is True
+
+
+def test_failed_forward_price_check_is_stated_explicitly_in_the_verdict(monkeypatch):
+    snapshot = _make_snapshot(spot=100.0, r=0.03, q=0.01, t_years=1.0, true_vol=0.25)
+    _patch_forward_check_to_see_a_biased_density(monkeypatch, factor=1.05)
+
+    report = build_report(snapshot, _make_rates(0.03, 0.01))
+
+    # The rest of the pipeline is perfectly healthy -- the density diagnostics
+    # and the arbitrage check don't flag anything -- yet the verdict must
+    # still say the forward-price check failed.
+    assert report.fitted_smile.butterfly_arbitrage_free
+    assert not report.diagnostics.flagged
+    assert report.verdict == Verdict.DIAGNOSTIC_WARNING
+    assert _FORWARD_FAILURE_PREFIX + "5.00%" in report.verdict_message
+    assert report.forward_price_check is not None and not report.forward_price_check.passed
+    assert "Forward-price check: FAILED" in report.summary()
+    assert _FORWARD_FAILURE_PREFIX in report.summary()  # the Verdict line carries it, not just the detail line
+    assert report.to_dict()["forward_price_check"]["passed"] is False
+    assert _FORWARD_FAILURE_PREFIX in report.to_dict()["verdict_message"]
+
+
+def test_forward_price_failure_is_not_swallowed_by_an_arbitrage_verdict(monkeypatch):
+    snapshot = _make_snapshot(spot=100.0, r=0.03, q=0.01, t_years=1.0, true_vol=0.25)
+    _patch_calibration_to_report_arbitrage(monkeypatch)
+    _patch_forward_check_to_see_a_biased_density(monkeypatch, factor=1.05)
+
+    report = build_report(snapshot, _make_rates(0.03, 0.01))
+
+    assert report.verdict == Verdict.ARBITRAGE_DETECTED
+    assert "Gatheral-Jacquier" in report.verdict_message
+    assert _FORWARD_FAILURE_PREFIX + "5.00%" in report.verdict_message
+
+
+def test_arbitrage_verdict_does_not_claim_a_forward_failure_that_did_not_happen(monkeypatch):
+    snapshot = _make_snapshot(spot=100.0, r=0.03, q=0.01, t_years=1.0, true_vol=0.25)
+    _patch_calibration_to_report_arbitrage(monkeypatch)
+
+    report = build_report(snapshot, _make_rates(0.03, 0.01))
+
+    assert report.verdict == Verdict.ARBITRAGE_DETECTED
+    assert "forward-price check" not in report.verdict_message
+    assert report.forward_price_check is not None and report.forward_price_check.passed
+
+
+def test_no_forward_price_check_when_no_density_was_extracted():
+    fetched_at = datetime.now()
+    quotes = [OptionQuote(strike=90.0, option_type="put", bid=1.0, ask=1.2, last_price=1.1, open_interest=10, volume=5)]
+    snapshot = OptionChainSnapshot(
+        ticker="ILLIQUID", expiration=fetched_at.date() + timedelta(days=30),
+        fetched_at=fetched_at, spot_price=100.0, quotes=quotes,
+    )
+
+    report = build_report(snapshot, _make_rates(0.03, 0.0))
+
+    assert report.verdict == Verdict.INSUFFICIENT_LIQUID_DATA
+    assert report.forward_price_check is None
+    assert report.to_dict()["forward_price_check"] is None
+    assert "Forward-price check" not in report.summary()
 
 
 def test_liquidity_floor_excludes_thin_quotes():
