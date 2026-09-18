@@ -141,6 +141,22 @@ Principle VI; clarify session thresholds).
 | `skewness` | `float` | |
 | `excess_kurtosis` | `float` | |
 
+## ForwardPriceCheck
+
+Produced by `core/moments.py::forward_price_check(rnd_grid, strikes, S0, r, q, T)`:
+the risk-neutral mean of the extracted density (trapezoidal integral of `K * f(K)`,
+not renormalized) against the theoretical forward `F = S0 * exp((r - q) * T)`
+(spec FR-011, SC-004).
+
+| Field | Type | Notes |
+|---|---|---|
+| `theoretical_forward` | `float` | `F = S0 * exp((r - q) * T)` |
+| `realized_mean` | `float` | Integral of `K * f(K)` over the grid |
+| `absolute_error` | `float` | `abs(realized_mean - theoretical_forward)` |
+| `relative_error` | `float` | `absolute_error / theoretical_forward` |
+| `threshold` | `float` | Default `1%` (`core/density.py::FORWARD_PRICE_RELATIVE_ERROR_THRESHOLD`) |
+| `passed` | `bool` | `relative_error <= threshold`; a NaN error fails |
+
 ## SmileShapeMetrics
 
 Desk-convention descriptors (spec FR-012).
@@ -159,7 +175,7 @@ Plain-language outcome classification (spec FR-013).
 |---|---|
 | `WELL_FIT_ARBITRAGE_FREE` | Smile fit converged, no-arbitrage holds, diagnostics within tolerance |
 | `ARBITRAGE_DETECTED` | Butterfly-arbitrage condition failed at fitted parameters |
-| `DIAGNOSTIC_WARNING` | Fit converged and is arbitrage-free but normalization or forward-price deviation exceeds 1% |
+| `DIAGNOSTIC_WARNING` | Fit converged and is arbitrage-free but the density is negative somewhere, or normalization error or forward-price error exceeds 1% (the message names each check that failed) |
 | `INSUFFICIENT_LIQUID_DATA` | Too few retained `CleanOTMPoint`s to calibrate a smile |
 
 ## ExtractionReport
@@ -177,6 +193,7 @@ object (see `contracts/public_api.md`).
 | `density_grid` | `DensityGrid \| None` | `None` only when verdict is `INSUFFICIENT_LIQUID_DATA` |
 | `diagnostics` | `DensityDiagnostics \| None` | `None` only when verdict is `INSUFFICIENT_LIQUID_DATA` |
 | `moments` | `DensityMoments \| None` | `None` only when verdict is `INSUFFICIENT_LIQUID_DATA` |
+| `forward_price_check` | `ForwardPriceCheck \| None` | `None` only when verdict is `INSUFFICIENT_LIQUID_DATA`. If `passed` is `False`, `verdict_message` always contains `forward-price check failed: extracted RND mean deviates from theoretical forward by X%` -- whatever the verdict is, including `ARBITRAGE_DETECTED`. |
 | `smile_shape_metrics` | `SmileShapeMetrics \| None` | `None` only when verdict is `INSUFFICIENT_LIQUID_DATA` |
 | `verdict` | `Verdict` | Always populated |
 | `verdict_message` | `str` | Human-readable rendering of `verdict` plus the specific reason |
