@@ -279,17 +279,34 @@ imminent, so American option prices can exceed the Black-Scholes-implied
 European price for in-the-money contracts.
 
 This library sidesteps the problem rather than modeling it: it only ever
-uses **out-of-the-money** quotes — OTM puts for strikes below the forward,
-OTM calls above it. The early-exercise premium on an OTM option is
-economically small (there's little value to exercising early into a position
-that's currently worth less than intrinsic, because there's no intrinsic
-value to capture), so treating OTM American quotes as approximately European
-introduces a much smaller, second-order error than either (a) using ITM
-quotes directly and ignoring the premium entirely, or (b) building a full
-American pricing model (binomial trees, or a free-boundary PDE solver) just
-for this correction. This is a deliberate, disclosed approximation, not an
+uses **out-of-the-money** quotes — puts with strike `< F` and calls with
+strike `>= F`, where `F = S0 * exp((r-q)*T)` is the forward price (this
+stitching happens as early as possible, in
+`data/yfinance_loader.py::fetch_otm_chain`, so an ITM quote is never even
+fetched into the pipeline, not merely filtered out downstream). The
+early-exercise premium on an OTM option is economically small (there's
+little value to exercising early into a position that's currently worth
+less than intrinsic, because there's no intrinsic value to capture), so
+treating OTM American quotes as approximately European introduces a much
+smaller, second-order error than either (a) using ITM quotes directly and
+ignoring the premium entirely, or (b) building a full American pricing
+model (binomial trees, or a free-boundary PDE solver) just for this
+correction. This is a deliberate, disclosed approximation, not an
 oversight: it's the standard convention practitioners use precisely because
 it's small and empirically well-behaved, not because it's exact.
+
+**A natural future extension**, not built here: if a liquid data source for
+genuinely European-style listed options (many index options, e.g. SPX
+rather than SPY, are cash-settled and European) becomes available, this
+whole approximation becomes unnecessary for that source — every quote,
+ITM or OTM, could be used directly with no early-exercise adjustment at
+all, since the pipeline's Black-Scholes/Breeden-Litzenberger assumptions
+would then hold exactly rather than approximately. That would be a change
+to the `data/` layer only (a different fetch + stitch function selecting
+by proximity to the forward rather than by moneyness sign, or simply no
+stitching at all); nothing in `core/` would need to change, which is
+itself a small piece of evidence that the `data/`-vs-`core/` boundary in
+this codebase is drawn in the right place.
 
 ## 7. Ground-truth validation
 

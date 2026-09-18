@@ -1,11 +1,12 @@
 """Top-level orchestration: single-call, single-snapshot RND extraction (spec FR-013).
 
 This is the seam between data/ (pandas/yfinance) and core/ (pure
-numpy/scipy): an OptionChainSnapshot's OptionQuote list is converted into
-plain CleanOTMPoint/ExcludedQuote records here before anything reaches
-core/, and this is where the single top-level public operation (extract())
-is assembled from core/'s independently-tested pieces (plan.md Structure
-Decision).
+numpy/scipy): an OptionChainSnapshot's OptionQuote list -- already
+OTM-selected by data/yfinance_loader.py's fetch_otm_chain -- is converted
+into plain CleanOTMPoint/ExcludedQuote records here (liquidity/crossed-
+market cleaning only) before anything reaches core/, and this is where the
+single top-level public operation (extract()) is assembled from core/'s
+independently-tested pieces (plan.md Structure Decision).
 """
 from __future__ import annotations
 
@@ -23,9 +24,12 @@ from breeden_litzenberger.core.moments import DensityMoments, compute_moments
 from breeden_litzenberger.core.smile import FittedSmile, calibrate_svi
 from breeden_litzenberger.core.smile_metrics import SmileShapeMetrics, compute_smile_shape_metrics
 from breeden_litzenberger.data.rates import RateInputs, resolve_rate_inputs
-from breeden_litzenberger.data.yfinance_loader import OptionChainSnapshot, OptionType, fetch_snapshot
-
-_DAYS_PER_YEAR = 365.25  # spec FR-004's explicit calendar-day convention
+from breeden_litzenberger.data.yfinance_loader import (
+    OptionChainSnapshot,
+    OptionType,
+    fetch_snapshot,
+    time_to_expiration,
+)
 
 # Minimum retained points to calibrate a 5-parameter SVI smile at all.
 # Below this the fit would be underdetermined, not just noisy -- spec
@@ -54,7 +58,10 @@ class ExcludedQuote:
 
 @dataclass(frozen=True)
 class CleanOTMPoint:
-    """A retained quote after liquidity/crossed-market/OTM selection (spec FR-005, FR-006)."""
+    """A retained quote after liquidity/crossed-market cleaning (spec FR-005);
+    OTM selection (spec FR-006) already happened at fetch time -- see
+    data/yfinance_loader.py's fetch_otm_chain.
+    """
 
     strike: float
     option_type: OptionType
@@ -68,10 +75,6 @@ class Verdict(Enum):
     ARBITRAGE_DETECTED = "butterfly arbitrage detected at fitted parameters"
     DIAGNOSTIC_WARNING = "fit converged but a diagnostic threshold was exceeded"
     INSUFFICIENT_LIQUID_DATA = "insufficient liquid strikes to fit a smile"
-
-
-class InvalidExpirationError(ValueError):
-    """``expiration`` is not strictly in the future relative to the snapshot (spec FR-004)."""
 
 
 class NoPlotDataError(ValueError):
@@ -192,7 +195,7 @@ class ExtractionReport:
                 f"a smile must have been fitted first"
             )
 
-        t = _time_to_expiration(self.snapshot)
+        t = time_to_expiration(self.snapshot.expiration, self.snapshot.fetched_at)
         smile = self.fitted_smile
 
         smile_strikes = np.array([p.strike for p in smile.retained_points])
@@ -226,22 +229,15 @@ def _compute_forward_price(spot: float, r: float, q: float, t: float) -> float:
     return float(spot * np.exp((r - q) * t))
 
 
-def _time_to_expiration(snapshot: OptionChainSnapshot) -> float:
-    """T = (expiration - fetched_at.date()).days / 365.25 (spec FR-004)."""
-    days = (snapshot.expiration - snapshot.fetched_at.date()).days
-    if days <= 0:
-        raise InvalidExpirationError(
-            f"expiration {snapshot.expiration} is not strictly in the future relative to "
-            f"the snapshot fetched at {snapshot.fetched_at}"
-        )
-    return days / _DAYS_PER_YEAR
-
-
-def _clean_and_select_otm(
-    snapshot: OptionChainSnapshot, forward_price: float, liquidity_floor: LiquidityFloor
+def _clean_quotes(
+    snapshot: OptionChainSnapshot, liquidity_floor: LiquidityFloor
 ) -> tuple[list[CleanOTMPoint], list[ExcludedQuote]]:
-    """FR-005 (liquidity/crossed-market cleaning) + FR-006 (OTM selection):
-    OTM puts below the forward price, OTM calls above it.
+    """FR-005 liquidity/crossed-market cleaning. OTM selection (FR-006)
+    already happened in data/yfinance_loader.py's fetch_otm_chain -- every
+    quote in ``snapshot.quotes`` is already known to be OTM relative to the
+    forward price computed at fetch time, so there is nothing left to tag
+    "not_otm" here; a non-OTM quote is simply never fetched in the first
+    place, not excluded after the fact.
     """
     retained: list[CleanOTMPoint] = []
     excluded: list[ExcludedQuote] = []
@@ -263,13 +259,6 @@ def _clean_and_select_otm(
             excluded.append(ExcludedQuote(quote.strike, quote.option_type, "below_liquidity_floor"))
             continue
 
-        is_otm = (quote.option_type == "put" and quote.strike < forward_price) or (
-            quote.option_type == "call" and quote.strike > forward_price
-        )
-        if not is_otm:
-            excluded.append(ExcludedQuote(quote.strike, quote.option_type, "not_otm"))
-            continue
-
         retained.append(CleanOTMPoint(strike=quote.strike, option_type=quote.option_type, mid_price=quote.mid_price))
 
     return retained, excluded
@@ -283,9 +272,14 @@ def extract(
     dividend_yield: float | None = None,
     liquidity_floor: LiquidityFloor | None = None,
 ) -> ExtractionReport:
-    """The single top-level operation (spec FR-013). See contracts/public_api.md."""
-    snapshot = fetch_snapshot(ticker, expiration)
+    """The single top-level operation (spec FR-013). See contracts/public_api.md.
+
+    Rates are resolved before the chain is fetched, not after: fetch_snapshot
+    needs (r, q) up front to compute the forward price its OTM stitching is
+    anchored to (data/yfinance_loader.py's fetch_otm_chain).
+    """
     rates = resolve_rate_inputs(ticker, risk_free_rate, dividend_yield)
+    snapshot = fetch_snapshot(ticker, expiration, rates.risk_free_rate, rates.dividend_yield)
     floor = liquidity_floor if liquidity_floor is not None else LiquidityFloor()
     return build_report(snapshot, rates, floor)
 
@@ -303,10 +297,10 @@ def build_report(
     floor = liquidity_floor if liquidity_floor is not None else LiquidityFloor()
     ticker, expiration = snapshot.ticker, snapshot.expiration
 
-    t = _time_to_expiration(snapshot)
+    t = time_to_expiration(snapshot.expiration, snapshot.fetched_at)
     forward_price = _compute_forward_price(snapshot.spot_price, rates.risk_free_rate, rates.dividend_yield, t)
 
-    clean_points, excluded = _clean_and_select_otm(snapshot, forward_price, floor)
+    clean_points, excluded = _clean_quotes(snapshot, floor)
 
     iv_points = []
     for point in clean_points:
