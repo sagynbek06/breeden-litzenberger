@@ -2,9 +2,12 @@
 
 Uses ``build_report()`` -- the pure, no-network half of ``extract()`` -- with
 a fixture ``OptionChainSnapshot``, so User Story 1's orchestration logic
-(cleaning, OTM selection, IV inversion, SVI fit, density extraction, verdict
+(liquidity cleaning, IV inversion, SVI fit, density extraction, verdict
 determination) is tested end-to-end without depending on live yfinance data
-or network availability in CI.
+or network availability in CI. OTM selection itself now happens earlier, in
+data/yfinance_loader.py's fetch_otm_chain, so these fixtures are built
+already OTM-consistent by construction (put strikes below the fixture's own
+forward, call strikes above it) rather than exercising an OTM filter here.
 """
 from __future__ import annotations
 

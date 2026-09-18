@@ -55,7 +55,7 @@ FR-007 — exclusions are logged, never silent).
 |---|---|---|
 | `strike` | `float` | |
 | `option_type` | `Literal["call", "put"]` | |
-| `reason` | `Literal["zero_bid", "crossed_market", "below_liquidity_floor", "not_otm", "below_intrinsic_value", "zero_price", "iv_bracket_failure"]` | |
+| `reason` | `Literal["zero_bid", "crossed_market", "below_liquidity_floor", "not_otm", "below_intrinsic_value", "zero_price", "iv_bracket_failure"]` | `"not_otm"` is retained in the type for completeness but is no longer produced in practice: OTM selection now happens at fetch time (`data/yfinance_loader.py::fetch_otm_chain`), so a non-OTM quote is simply never fetched rather than fetched-then-excluded. |
 
 ## CleanOTMPoint
 
